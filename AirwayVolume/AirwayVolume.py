@@ -209,9 +209,9 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
     volumeCropper = slicer.modules.cropvolume.logic()
     volumeCropper.CropVoxelBased(targetROI, inputVolume, newVolume)
 
-    self.buildSegment(newVolume)
+    segmentationNode = self.buildSegment(newVolume, name="master_airway")
 
-    if not markupsList is None:
+    if markupsList is not None:
       # Add the bottom coordinate of the cropped volume as a bound
       cutoffList = []
       volumeBounds = [0,0,0,0,0,0]
@@ -237,7 +237,8 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
 
         volumeCropper.CropVoxelBased(subROI, newVolume, subVolume)
 
-        self.buildSegment(subVolume, name="airway_" + str(idx))
+        # ! segmentationNode parameter is currently broken - re add to this call when fixed
+        self.buildSegment(subVolume, masterSegment=segmentationNode.GetSegmentation().GetNthSegment(0), name="airway_" + str(idx))
         lowerBound = bound
 
         slicer.mrmlScene.RemoveNode(subVolume)
@@ -248,7 +249,7 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
 
   # FIXME: Table fails to display properly: statistics are not calculated
   def findVolume(self, segment):
-    # TODO: find out whether closed surface volume or labelmap volume is more accurate and use the better one
+    # TODO: labelmap volume is more accurate: switch to labelmap based volume calculation
     
     segStats = SegmentStatistics.SegmentStatisticsLogic()
     #//params = segStats.getParameterNode()
@@ -264,8 +265,8 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
     segStats.exportToTable(table)
     segStats.showTable(table)
 
-  # TODO: figure out how to put all of the created segments in the same segmentation
-  def buildSegment(self, inputVolme, segmentationNode = None, name='airway'):
+  # FIXME: segmentationNode parameter is currently broken
+  def buildSegment(self, inputVolme, masterSegment=None, segmentationNode=None, name='airway'):
     if(segmentationNode == None):
       segmentationNode = slicer.vtkMRMLSegmentationNode()
       slicer.mrmlScene.AddNode(segmentationNode)
@@ -278,15 +279,25 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
     segmentationEditor.setMRMLScene(slicer.mrmlScene)
     segmentationEditor.setMRMLSegmentEditorNode(slicer.mrmlScene.AddNewNodeByClass('vtkMRMLSegmentEditorNode'))
     segmentationEditor.setSegmentationNode(segmentationNode)
-    #//segmentationEditor.ad
+    #//segmentationEditor.ad    & test &
     # ? What was this line supposed to be? I can't remember but it doesn't seem to be causing problems for now
     segmentationEditor.setMasterVolumeNode(inputVolme)
+    
+    #import qSlicerSegmentationEditorEffectsPythonQt as effects
 
     segmentationEditor.setActiveEffectByName('Threshold')
     effect = segmentationEditor.activeEffect()
     effect.setParameter('MinimumThreshold', '-1024')
     effect.setParameter('MaximumThreshold', AIR_DENSITY_THRESHOLD)
     effect.self().onApply()
+
+    # FIXME: part of the fix for handling out of bounds air - currently broken
+    #if masterSegment is not None:
+      #segmentationEditor.setActiveEffectByName('Logical operators')
+      #effect = segmentationEditor.activeEffect()
+      #effect.setParameter('ModifierSegmentID', masterSegment.GetName())
+      #effect.setParameter('Operation', 'INTERSECT')
+      #effect.self().onApply()
 
     segmentationEditor.setActiveEffectByName('Islands')
     effect = segmentationEditor.activeEffect()
@@ -301,15 +312,22 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
     normals.Update()
     surfaceMesh = normals.GetOutput() 
 
+    return segmentationNode
+
+  # * autoAlign only works when the markups are placed in the clockwise direction, starting from the patient's right
   def autoAlign(self, markupsList, inputVolume):
+
+    if markupsList.GetNumberOfFiducials() is not 3:
+      raise ValueError("Orientation markup must contain exactly 3 fiducials")
+
     coordinateList = []
-    for i in range(markupsList.GetNumberOfFiducials()):
-      x = [0,0,0]
-      markupsList.GetNthFiducialPosition(i, x)
+    for i in range(3):
+      x = [0,0,0,0]
+      markupsList.GetNthFiducialWorldCoordinates(i, x)
+      del x[3]
       coordinateList.append(x)
 
-    # TODO: throw an exception if there are not exactly three points in the list
-    
+    # create two vectors that define a plane between the three specified points
     vectorA = [coordinateList[1][dim] - coordinateList[0][dim] for dim in range(3)]
     vectorB = [coordinateList[2][dim] - coordinateList[0][dim] for dim in range(3)]
 
@@ -319,7 +337,6 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
     length = np.sqrt(length)
     vectorNorm /= length
     
-    # weird fact: RAS coordinates work like z, x, y if you think from a lateral view
     v = np.cross(vectorNorm, [0,0,1])
     # v represents the skew-symmetric cross product of the normal vector and the vertical unit vector
     v = [[     0, -v[2],  v[1]],
@@ -331,40 +348,107 @@ class AirwayVolumeLogic(ScriptedLoadableModuleLogic):
          [ 0, 0, 1]]
 
     n = np.add(x, v)
+
     # c represents the cosine of the angle between the given normal and the vertical unit vector
     c = (vectorNorm[2] / np.sqrt(np.sum(np.power(dim, 2) for dim in vectorNorm)))
-    logging.info('arccos')
-    logging.info(np.arccos(c))
     m = np.linalg.matrix_power(v, 2) * (1/(1+c))
 
     r = np.add(n, m)
 
-    # correction matrix: for some reason the computed transform is mirrored in the x and z axes,
-    # so a correction matrix is used to rectify it
-    x = [[ 1, 0, 0],
-         [ 0,-1, 0],
-         [ 0, 0,-1]]
-    r = np.dot(r,x)
+    # find offset between horzontally aligned points
+    point = []
+    point.append(np.dot(r, coordinateList[0]))
+    point.append(np.dot(r, coordinateList[2]))
+    xOffset = point[0][0] - point[1][0]
+    yOffset = point[1][1] - point[0][1]
 
-    ## Offsets x rotation based on the centered position of the first point 
-    #xOffset = coordinateList[0][0]
-    #yOffset = coordinateList[0][1]
-    #tOffset = np.arcsin(xOffset/yOffset)
-    #x = [[ np.cos(tOffset), -np.sin(tOffset), 0],
-         #[ np.sin(tOffset), np.cos(tOffset), 0],
-         #[               0,               0, 0]]
-    #r = np.dot(r,x)
+    # find angle between points
+    angle = np.arctan2(yOffset, xOffset)
 
+    # create rotation matrix based on that angle
+    x = [[ np.cos(angle), -np.sin(angle) , 0],
+         [ np.sin(angle), np.cos(angle), 0],
+         [ 0, 0, 1]]
+
+    # find product of transformation and rotation matricies
+    r = np.dot(x,r)
+
+    # add fourth row/column to make 4x4 shape
     r2 = np.c_[ r, np.zeros(3)]
     rotMatrix = np.r_[ r2, [[0,0,0,1]]]
 
+    # apply transformation to volume and points
     vtkRotMatrix = vtk.vtkMatrix4x4()
     [ [ vtkRotMatrix.SetElement(row, col, rotMatrix[row, col]) for row in range(4) ] for col in range(4) ]
     transform = slicer.vtkMRMLTransformNode()
     transform.SetMatrixTransformToParent(vtkRotMatrix)
     slicer.mrmlScene.AddNode(transform)
     inputVolume.SetAndObserveTransformNodeID(transform.GetID())
+    markupsList.SetAndObserveTransformNodeID(transform.GetID())
 
+  def segmentAnalysis(self, segmentationNode, segmentID):
+    # segment analysis is based on SlicerAreaPlot.py by hherhold on GitHub
+    # full source available at https://gist.github.com/hherhold/0492146f70ef0fc511b7b21410264481
+
+    vtkImage = segmentationNode.GetBinaryLabelmapRepresentation(segmentID)
+    voxelArr = vtk.util.numpy_support.vtk_to_numpy(vtkImage.GetPointData().GetScalars())
+
+    shape = vtkImage.GetDimensions()
+
+    # Saggital
+    s = shape[0]
+    # Coronal
+    c = shape[1]
+    # Axial
+    a = shape[2]
+
+    voxelArr3d = voxelArr.reshape((a, c, s))
+    voxelArrSliced = voxelArr3d.reshape([-1, s*c])
+
+    voxelArrSlicedPos = voxelArrSliced[:]>0
+
+    voxelCount = np.count_nonzero(voxelArrSlicedPos, axis=1)
+    voxelArea = vtkImage.GetSpacing()[0] * vtkImage.GetSpacing()[1]
+    # Area of each slice in mm2
+    voxelCountmm2 = voxelCount * voxelArea
+
+    #//logging.info('\n'.join([''.join(['{:2}'.format(item) for item in row]) 
+    #//  for row in voxelArr3d[0]]))
+
+    # ! All of the statistics calculated past this line are currently untested so they might be wrong
+    verticalDiameter = [ max([ np.count_nonzero(m) for m in n ])  for n in voxelArr3d ]
+    verticalDiametermm = [ n * vtkImage.GetSpacing()[1] for n in verticalDiameter ]
+
+    horizontalDiameter = [ max([ np.count_nonzero(m) for m in zip(*n[::-1]) ]) for n in voxelArr3d ]
+    horizontalDiametermm = [ n * vtkImage.GetSpacing()[0] for n in horizontalDiameter ]
+
+    avgVerticalDiameter = sum(verticalDiametermm) / len(verticalDiameter)
+    maxVerticalDiameter = max(verticalDiametermm)
+    minVerticalDiameter = min(verticalDiametermm)
+
+    avgHorizontalDiameter = sum(horizontalDiametermm) / len(verticalDiameter)
+    maxHorizontalDiameter = max(horizontalDiametermm)
+    minHorizontalDiameter = min(horizontalDiametermm)
+
+    logging.info(verticalDiametermm[0])
+    logging.info(horizontalDiametermm[0])
+    logging.info(maxHorizontalDiameter)
+    logging.info(maxHorizontalDiameter)
+    
+    # create table
+    tableNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLTableNode', 'Segment Quantification')
+    table = tableNode.GetTable()
+    table.SetNumberOfRows(len(voxelArr3d))
+
+    sliceNumberArray = vtk.vtkFloatArray()
+    sliceNumberArray.SetName('Slice Number')
+    table.AddColumn(sliceNumberArray)
+    # FIXME: this loop crashes slicer for some reason
+    [table.SetValue(i, 0, i) for i in range(len(voxelArr3d))]
+
+    # TODO: Add visuals with vtkMRMLPlotChartNode
+
+# TODO: Replace default self test with real tests
 class AirwayVolumeTest(ScriptedLoadableModuleTest):
   """
   This is the test case for your scripted module.
